@@ -1919,36 +1919,38 @@ auto write(OutputIt out, const T& value) -> typename std::enable_if<
 
 // An argument visitor that formats the argument and writes it via the output
 // iterator. It's a class and not a generic lambda for compatibility with C++11.
-template <typename OutputIt, typename Char> struct default_arg_formatter {
-  using context = basic_format_context<OutputIt, Char>;
+template <typename Char> struct default_arg_formatter {
+  using iterator = buffer_appender<Char>;
+  using context = buffer_context<Char>;
 
-  OutputIt out;
+  iterator out;
   basic_format_args<context> args;
   locale_ref loc;
 
-  template <typename T> auto operator()(T value) -> OutputIt {
+  template <typename T> auto operator()(T value) -> iterator {
     return write<Char>(out, value);
   }
-  auto operator()(typename basic_format_arg<context>::handle h) -> OutputIt {
+  auto operator()(typename basic_format_arg<context>::handle h) -> iterator {
     basic_format_parse_context<Char> parse_ctx({});
-    basic_format_context<OutputIt, Char> format_ctx(out, args, loc);
+    context format_ctx(out, args, loc);
     h.format(parse_ctx, format_ctx);
     return format_ctx.out();
   }
 };
 
-template <typename OutputIt, typename Char> struct arg_formatter {
-  using context = basic_format_context<OutputIt, Char>;
+template <typename Char> struct arg_formatter {
+  using iterator = buffer_appender<Char>;
+  using context = buffer_context<Char>;
 
-  OutputIt out;
+  iterator out;
   const basic_format_specs<Char>& specs;
   locale_ref locale;
 
   template <typename T>
-  FMT_CONSTEXPR FMT_INLINE auto operator()(T value) -> OutputIt {
+  FMT_CONSTEXPR FMT_INLINE auto operator()(T value) -> iterator {
     return detail::write(out, value, specs, locale);
   }
-  auto operator()(typename basic_format_arg<context>::handle) -> OutputIt {
+  auto operator()(typename basic_format_arg<context>::handle) -> iterator {
     // User-defined types are handled separately because they require access
     // to the parse context.
     return out;
@@ -2079,58 +2081,6 @@ class specs_handler : public specs_setter<typename Context::char_type> {
 
   ParseContext& parse_context_;
   Context& context_;
-};
-
-template <typename OutputIt, typename Char, typename Context>
-struct format_handler : detail::error_handler {
-  basic_format_parse_context<Char> parse_context;
-  Context context;
-
-  format_handler(OutputIt out, basic_string_view<Char> str,
-                 basic_format_args<Context> format_args, detail::locale_ref loc)
-      : parse_context(str), context(out, format_args, loc) {}
-
-  void on_text(const Char* begin, const Char* end) {
-    auto text = basic_string_view<Char>(begin, to_unsigned(end - begin));
-    context.advance_to(write<Char>(context.out(), text));
-  }
-
-  int on_arg_id() { return parse_context.next_arg_id(); }
-  int on_arg_id(int id) { return parse_context.check_arg_id(id), id; }
-  int on_arg_id(basic_string_view<Char> id) {
-    int arg_id = context.arg_id(id);
-    if (arg_id < 0) on_error("argument not found");
-    return arg_id;
-  }
-
-  FMT_INLINE void on_replacement_field(int id, const Char*) {
-    auto arg = get_arg(context, id);
-    context.advance_to(visit_format_arg(
-        default_arg_formatter<OutputIt, Char>{context.out(), context.args(),
-                                              context.locale()},
-        arg));
-  }
-
-  const Char* on_format_specs(int id, const Char* begin, const Char* end) {
-    auto arg = get_arg(context, id);
-    if (arg.type() == type::custom_type) {
-      parse_context.advance_to(parse_context.begin() +
-                               (begin - &*parse_context.begin()));
-      visit_format_arg(custom_formatter<Context>(parse_context, context), arg);
-      return parse_context.begin();
-    }
-    auto specs = basic_format_specs<Char>();
-    using parse_context_t = basic_format_parse_context<Char>;
-    specs_checker<specs_handler<parse_context_t, Context>> handler(
-        specs_handler<parse_context_t, Context>(specs, parse_context, context),
-        arg.type());
-    begin = parse_format_specs(begin, end, handler);
-    if (begin == end || *begin != '}') on_error("missing '}' in format string");
-    auto f = detail::arg_formatter<OutputIt, Char>{context.out(), specs,
-                                                   context.locale()};
-    context.advance_to(visit_format_arg(f, arg));
-    return begin;
-  }
 };
 
 template <template <typename> class Handler, typename Context>
@@ -2629,12 +2579,69 @@ void detail::vformat_to(
   if (fmt.size() == 2 && equal2(fmt.data(), "{}")) {
     auto arg = args.get(0);
     if (!arg) error_handler().on_error("argument not found");
-    visit_format_arg(default_arg_formatter<iterator, Char>{out, args, loc},
-                     arg);
+    visit_format_arg(default_arg_formatter<Char>{out, args, loc}, arg);
     return;
   }
-  format_handler<iterator, Char, buffer_context<Char>> h(out, fmt, args, loc);
-  parse_format_string<false>(fmt, h);
+
+  struct format_handler : detail::error_handler {
+    // Always use the buffer context/appender to prevent code bloat.
+    using iterator = buffer_appender<Char>;
+    using context_type = buffer_context<Char>;
+
+    basic_format_parse_context<Char> parse_context;
+    context_type context;
+
+    format_handler(iterator out, basic_string_view<Char> str,
+                   basic_format_args<context_type> format_args,
+                   detail::locale_ref loc)
+        : parse_context(str), context(out, format_args, loc) {}
+
+    void on_text(const Char* begin, const Char* end) {
+      auto text = basic_string_view<Char>(begin, to_unsigned(end - begin));
+      context.advance_to(write<Char>(context.out(), text));
+    }
+
+    int on_arg_id() { return parse_context.next_arg_id(); }
+    int on_arg_id(int id) { return parse_context.check_arg_id(id), id; }
+    int on_arg_id(basic_string_view<Char> id) {
+      int arg_id = context.arg_id(id);
+      if (arg_id < 0) on_error("argument not found");
+      return arg_id;
+    }
+
+    FMT_INLINE void on_replacement_field(int id, const Char*) {
+      auto arg = get_arg(context, id);
+      context.advance_to(visit_format_arg(
+          default_arg_formatter<Char>{context.out(), context.args(),
+                                      context.locale()},
+          arg));
+    }
+
+    const Char* on_format_specs(int id, const Char* begin, const Char* end) {
+      auto arg = get_arg(context, id);
+      if (arg.type() == type::custom_type) {
+        parse_context.advance_to(parse_context.begin() +
+                                 (begin - &*parse_context.begin()));
+        visit_format_arg(custom_formatter<context_type>(parse_context, context),
+                         arg);
+        return parse_context.begin();
+      }
+      auto specs = basic_format_specs<Char>();
+      using parse_context_t = basic_format_parse_context<Char>;
+      specs_checker<specs_handler<parse_context_t, context_type>> handler(
+          specs_handler<parse_context_t, context_type>(specs, parse_context,
+                                                       context),
+          arg.type());
+      begin = parse_format_specs(begin, end, handler);
+      if (begin == end || *begin != '}')
+        on_error("missing '}' in format string");
+      auto f =
+          detail::arg_formatter<Char>{context.out(), specs, context.locale()};
+      context.advance_to(visit_format_arg(f, arg));
+      return begin;
+    }
+  };
+  parse_format_string<false>(fmt, format_handler(out, fmt, args, loc));
 }
 
 #ifndef FMT_HEADER_ONLY
